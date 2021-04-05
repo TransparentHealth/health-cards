@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.3
+
+Document CORS expectation for `.well-known/jwks.json`
+
+## 0.4.2
+
+Replace `iat` with `nbf` in JWT payload encoding
+
+## 0.4.1
+
+Added optional `x5c` in JWKS
+
+## 0.3.1
+
+Add optional `vcIndex` param on `$health-cards-issue` response's `resourceLink`
+
+## 0.3.0
+
+Rename `$HealthWallet.issueVc` to `$health-cards-issue`
+
+## 0.2.0
+
+Chunk-based QR representation of larger Health Cards (JWS > 1195 characters). Defines `shc:/<n>/<c>/` prefix, where `<n>` represents a chunk number and `<c>` represents the total chunk count.
+
+## 0.1.1
+
+Added `shc:/` prefix for QR representations.
+
 ## 0.1.0
 
 Significant API overhaul to reduce scope and simplify dependencies. See [PR#64](https://github.com/smart-on-fhir/health-cards/pull/64) for details.

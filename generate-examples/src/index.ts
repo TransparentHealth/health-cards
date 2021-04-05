@@ -4,14 +4,20 @@ import fs from 'fs';
 import got from 'got';
 import jose, { JWK } from 'node-jose';
 import pako from 'pako';
-import QrCode from 'qrcode';
+import QrCode, { QRCodeSegment } from 'qrcode';
 import issuerPrivateKeys from './config/issuer.jwks.private.json';
 
 const ISSUER_URL = process.env.ISSUER_URL || 'https://smarthealth.cards/examples/issuer';
 
-const exampleBundleUrls = [
-  'http://build.fhir.org/ig/dvci/vaccine-credential-ig/branches/main/Bundle-Scenario1Bundle.json',
-  'http://build.fhir.org/ig/dvci/vaccine-credential-ig/branches/main/Bundle-Scenario2Bundle.json',
+interface BundleInfo {
+  url: string;
+  issuerIndex: number;
+}
+
+const exampleBundleInfo: BundleInfo[] = [
+  {url: 'http://build.fhir.org/ig/dvci/vaccine-credential-ig/branches/main/Bundle-Scenario1Bundle.json', issuerIndex: 0},
+  {url: 'http://build.fhir.org/ig/dvci/vaccine-credential-ig/branches/main/Bundle-Scenario2Bundle.json', issuerIndex: 2},
+  {url: 'https://www.hl7.org/fhir/diagnosticreport-example-ghp.json', issuerIndex: 0}
 ];
 
 interface Bundle {
@@ -33,7 +39,7 @@ interface StringMap {
 
 export interface HealthCard {
   iss: string;
-  iat: number;
+  nbf: number;
   exp: number;
   vc: {
     type: string[];
@@ -82,11 +88,15 @@ async function trimBundleForHealthCard(bundleIn: Bundle) {
   bundle.entry.forEach((e) => {
     e.fullUrl = resourceUrlMap[e.fullUrl.split('/').slice(-2).join('/')];
     function clean(r: any, path: string[] = ['Resource']) {
+
       if (r.resourceType === 'Patient') {
+        // TODO remove these `delete`s once sample bundles are aligned
+        // with the "name + DOB" profiling guidance
         delete r.telecom;
         delete r.communication;
         delete r.address;
       }
+
       if (path.length === 1) {
         delete r.id;
         delete r.meta;
@@ -94,12 +104,14 @@ async function trimBundleForHealthCard(bundleIn: Bundle) {
       }
       if (resourceUrlMap[r.reference]) {
         r.reference = resourceUrlMap[r.reference];
+      } else if (r?.reference?.startsWith("Patient")) {
+        //TODO remove this branch when DVCI bundles are fixed
+        r.reference = 'resource:0'
       }
       if (r.coding) {
         delete r.text;
       }
-      // Address bug in hosted examples
-      if (r.system === 'https://phinvads.cdc.gov/vads/ViewCodeSystem.action?id=2.16.840.1.113883.12.292') {
+      if (r.system === 'http://hl7.org/fhir/sid/cvx-TEMPORARY-CODE-SYSTEM') {
         r.system = 'http://hl7.org/fhir/sid/cvx';
       }
       if (r.system && r.code) {
@@ -117,17 +129,16 @@ async function trimBundleForHealthCard(bundleIn: Bundle) {
   return bundle;
 }
 
-function createHealthCardJwsPayload(fhirBundle: Bundle): Record<string, unknown> {
+function createHealthCardJwsPayload(fhirBundle: Bundle, types: string[]): Record<string, unknown> {
   return {
     iss: ISSUER_URL,
-    iat: new Date().getTime() / 1000,
+    nbf: new Date().getTime() / 1000,
     vc: {
       '@context': ['https://www.w3.org/2018/credentials/v1'],
       type: [
         'VerifiableCredential',
         'https://smarthealth.cards#health-card',
-        'https://smarthealth.cards#immunization',
-        'https://smarthealth.cards#covid19',
+        ...types
       ],
       credentialSubject: {
         fhirVersion: '4.0.1',
@@ -137,8 +148,22 @@ function createHealthCardJwsPayload(fhirBundle: Bundle): Record<string, unknown>
   };
 }
 
-async function createHealthCardFile(jwsPayload: Record<string, unknown>): Promise<Record<string, any>> {
-  const signer = new Signer({ signingKey: await JWK.asKey(issuerPrivateKeys.keys[0]) });
+const MAX_SINGLE_JWS_SIZE = 1195;
+const MAX_CHUNK_SIZE = 1191;
+const splitJwsIntoChunks = (jws: string): string[] => {
+  if (jws.length <= MAX_SINGLE_JWS_SIZE) {
+    return [jws];
+  }
+
+  // Try to split the chunks into roughly equal sizes.
+  const chunkCount = Math.ceil(jws.length / MAX_CHUNK_SIZE);
+  const chunkSize = Math.ceil(jws.length / chunkCount);
+  const chunks = jws.match(new RegExp(`.{1,${chunkSize}}`, 'g'));
+  return chunks || [];
+}
+
+async function createHealthCardFile(jwsPayload: Record<string, unknown>, keyIndex: number = 0): Promise<Record<string, any>> {
+  const signer = new Signer({ signingKey: await JWK.asKey(issuerPrivateKeys.keys[keyIndex]) });
   const signed = await signer.signJws(jwsPayload);
   return {
     verifiableCredential: [signed],
@@ -146,73 +171,91 @@ async function createHealthCardFile(jwsPayload: Record<string, unknown>): Promis
 }
 
 const SMALLEST_B64_CHAR_CODE = 45; // "-".charCodeAt(0) === 45
-const toNumericQr = (jws: string): string =>
-  jws
-    .split('')
-    .map((c) => c.charCodeAt(0) - SMALLEST_B64_CHAR_CODE)
-    .flatMap((c) => [Math.floor(c / 10), c % 10])
-    .join('');
+const toNumericQr = (jws: string, chunkIndex: number, totalChunks: number): QRCodeSegment[] => [
+  { data: 'shc:/' + ((totalChunks > 1) ? `${chunkIndex + 1}/${totalChunks}/` : ``), mode: 'byte' },
+  {
+    data: jws
+      .split('')
+      .map((c) => c.charCodeAt(0) - SMALLEST_B64_CHAR_CODE)
+      .flatMap((c) => [Math.floor(c / 10), c % 10])
+      .join(''),
+    mode: 'numeric',
+  },
+];
 
-async function processExampleBundle(exampleBundleUrl: string) {
-  const exampleBundleRetrieved = (await got(exampleBundleUrl).json()) as Bundle;
+async function processExampleBundle(exampleBundleInfo: BundleInfo): Promise<{ fhirBundle: Bundle; payload: Record<string, unknown>; file: Record<string, any>; qrNumeric: string[]; qrSvgFiles: string[]; }> {
+  let types = exampleBundleInfo.url.match("vaccine") ? [
+    'https://smarthealth.cards#immunization',
+    'https://smarthealth.cards#covid19',
+  ] : [];
+
+  const exampleBundleRetrieved = (await got(exampleBundleInfo.url).json()) as Bundle;
   const exampleBundleTrimmedForHealthCard = await trimBundleForHealthCard(exampleBundleRetrieved);
-  const exampleJwsPayload = createHealthCardJwsPayload(exampleBundleTrimmedForHealthCard);
-  const exampleBundleHealthCardFile = await createHealthCardFile(exampleJwsPayload);
-  const exampleBundleHealthCardNumericQr = toNumericQr(exampleBundleHealthCardFile.verifiableCredential[0]);
+  const exampleJwsPayload = createHealthCardJwsPayload(exampleBundleTrimmedForHealthCard, types);
+  const exampleBundleHealthCardFile = await createHealthCardFile(exampleJwsPayload, exampleBundleInfo.issuerIndex);
 
-  const exampleQrCode: string = await new Promise((resolve, reject) =>
-    QrCode.toString(
-      [{ data: exampleBundleHealthCardNumericQr, mode: 'numeric' }],
-      { type: 'svg' },
-      function (err: any, result: string) {
+  const jws = exampleBundleHealthCardFile.verifiableCredential[0] as string;
+  const jwsChunks = splitJwsIntoChunks(jws);
+  const qrSet = jwsChunks.map((c, i, chunks) => toNumericQr(c, i, chunks.length));
+  const exampleBundleHealthCardNumericQr = qrSet.map(qr => qr.map(({ data }) => data).join(''));
+
+  const exampleQrCodes: string[] = await Promise.all(
+    qrSet.map((qrSegments): Promise<string> => new Promise((resolve, reject) =>
+      QrCode.toString(qrSegments, { type: 'svg', errorCorrectionLevel: 'low' }, function (err: any, result: string) {
         if (err) return reject(err);
         resolve(result as string);
-      },
-    ),
-  );
+      })
+    )));
 
   return {
     fhirBundle: exampleBundleTrimmedForHealthCard,
     payload: exampleJwsPayload,
     file: exampleBundleHealthCardFile,
     qrNumeric: exampleBundleHealthCardNumericQr,
-    qrSvg: exampleQrCode,
+    qrSvgFiles: exampleQrCodes,
   };
 }
 
 async function generate(options: { outdir: string }) {
   const exampleIndex: string[][] = [];
-  const writeExamples = exampleBundleUrls.map(async (url, i) => {
+  const writeExamples = exampleBundleInfo.map(async (info, i) => {
     const exNum = i.toLocaleString('en-US', {
       minimumIntegerDigits: 2,
       useGrouping: false,
     });
     const outputPrefix = `example-${exNum}-`;
-    const example = await processExampleBundle(url);
+    const example = await processExampleBundle(info);
     const fileA = `${outputPrefix}a-fhirBundle.json`;
     const fileB = `${outputPrefix}b-jws-payload-expanded.json`;
     const fileC = `${outputPrefix}c-jws-payload-minified.json`;
     const fileD = `${outputPrefix}d-jws.txt`;
     const fileE = `${outputPrefix}e-file.smart-health-card`;
-    const fileF = `${outputPrefix}f-qr-code-numeric.txt`;
-    const fileG = `${outputPrefix}g-qr-code.svg`;
+
+    const fileF = example.qrNumeric.map((qr, i) => `${outputPrefix}f-qr-code-numeric-value-${i}.txt`);
+    const fileG = example.qrSvgFiles.map((qr, i) => `${outputPrefix}g-qr-code-${i}.svg`);
 
     fs.writeFileSync(`${options.outdir}/${fileA}`, JSON.stringify(example.fhirBundle, null, 2));
     fs.writeFileSync(`${options.outdir}/${fileB}`, JSON.stringify(example.payload, null, 2));
     fs.writeFileSync(`${options.outdir}/${fileC}`, JSON.stringify(example.payload));
     fs.writeFileSync(`${options.outdir}/${fileD}`, example.file.verifiableCredential[0]);
     fs.writeFileSync(`${options.outdir}/${fileE}`, JSON.stringify(example.file, null, 2));
-    fs.writeFileSync(`${options.outdir}/${fileF}`, example.qrNumeric);
-    fs.writeFileSync(`${options.outdir}/${fileG}`, example.qrSvg);
+    example.qrNumeric.forEach((qr, i) => {
+      fs.writeFileSync(`${options.outdir}/${fileF[i]}`, qr);
+    });
+
+    example.qrSvgFiles.forEach((qr, i) => {
+      fs.writeFileSync(`${options.outdir}/${fileG[i]}`, qr);
+    });
 
     const exampleEntry: string[] = [];
+
     exampleEntry.push(fileA);
     exampleEntry.push(fileB);
     exampleEntry.push(fileC);
     exampleEntry.push(fileD);
     exampleEntry.push(fileE);
-    exampleEntry.push(fileF);
-    exampleEntry.push(fileG);
+    fileF.forEach(f => exampleEntry.push(f))
+    fileG.forEach(f => exampleEntry.push(f))
     exampleIndex[i] = exampleEntry;
   });
 
@@ -220,7 +263,7 @@ async function generate(options: { outdir: string }) {
   fs.writeFileSync(
     `${options.outdir}/index.md`,
     '# Example Resources \n' +
-      exampleIndex.map((e, i) => `## Example ${i}\n\n` + e.map((f) => `* [${f}](./${f})`).join('\n')).join('\n\n'),
+    exampleIndex.map((e, i) => `## Example ${i}\n\n` + e.map((f) => `* [${f}](./${f})`).join('\n')).join('\n\n'),
   );
 }
 
